@@ -1,0 +1,1520 @@
+---
+title: "Guided_Differentiation_Code"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+# setup environment
+knitr::opts_chunk$set(echo = TRUE)
+
+# set working directory
+knitr::opts_knit$set(root.dir = "/project2/gilad/emcintire/")
+setwd("/project2/gilad/emcintire/")
+getwd()
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# clear all objects from the work space
+rm(list=ls())
+
+# set R library path as personal directory for this session
+.libPaths(new = "~/R/x86_64-pc-linux-gnu-library/4.2")
+
+# loading package(s)
+suppressPackageStartupMessages({
+library(data.table)          
+library(Matrix)
+library(tidyverse)                                        
+library(cowplot)    
+library(ggrepel) 
+library(patchwork)
+library(elementalist)
+library(ggrepel)                                          
+library(RColorBrewer)      
+library(patchwork)
+library(NMF)                                              
+library(ggalluvial)   
+library(CellChat)
+library(Seurat, lib.loc = "/software/R-4.2.0-el7-x86_64/lib64/R/library")
+library(scPred)
+})
+
+# increase globals for sctransform
+options(future.globals.maxSize= 1024*1024^3)
+
+options(stringsAsFactors = FALSE)
+```
+
+
+**FIGURE 1 CELL CLUSTERING, ANALYSIS, AND ANNOTATION**
+```{r, eval=TRUE, echo=FALSE}
+# read in 10X data
+day7_raw_data <- Read10X("/project2/gilad/emcintire/cell_ranger/220510_A00639_1151_BH3YKKDRX2-YG-EM-17S-lns12/YG-EM-ln1-EM314_human/outs/filtered_feature_bc_matrix/")
+
+# setting directory for deconvolution files
+dir <- "/project2/gilad/emcintire/cell_ranger/220510_A00639_1151_BH3YKKDRX2-YG-EM-17S-lns12/YG-EM-ln1-EM314_human/"
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# creates a Seurat object
+day7_obj <- CreateSeuratObject(day7_raw_data)
+
+# demultiplex individuals
+# add vireo information (demultiplex to identify individuals)
+add_vireo <- function(day7_obj, dir) {
+  donor_ids <- read.table(paste0(dir, 'vireo/donor_ids.tsv'), header = TRUE, stringsAsFactors = FALSE)
+  
+  day7_obj <- AddMetaData(day7_obj, donor_ids$donor_id,   col.name ='vireo.individual')
+  day7_obj <- AddMetaData(day7_obj, donor_ids$prob_max,   col.name ='vireo.prob.singlet')
+  
+  ambient.file <- paste0(dir, 'vireo/prop_ambient.tsv')
+  if (file.exists(ambient.file)) {
+    prop <- read.table(paste0(dir, 'vireo/prop_ambient.tsv'), header = TRUE, stringsAsFactors = FALSE)
+    
+    inds <- unique(donor_ids$best_singlet)
+    donor_ids$prop_donor <- 0
+    for (i in 1:length(inds)) {
+      w <- which(donor_ids$best_singlet==inds[i])
+      donor_ids$prop_donor[w] <- prop[w,inds[i]]
+    }
+    day7_obj <- AddMetaData(day7_obj, donor_ids$prop_donor, col.name ='vireo.prop.donor')
+  }
+  day7_obj
+}
+
+day7_obj <- add_vireo(day7_obj, dir)
+
+individual.colname <- ('vireo.individual')
+individual.colname <- individual.colname[which(individual.colname %in% colnames(day7_obj@meta.data))][1]
+```
+
+
+
+```{r, eval=TRUE, echo=TRUE}
+# print each object's information on cells and features
+NA19114_obj <- subset(x = day7_obj, subset = vireo.individual == "NA19114")
+NA19130_obj <- subset(x = day7_obj, subset = vireo.individual == "NA19130")
+NA19152_obj <- subset(x = day7_obj, subset = vireo.individual == "NA19152")
+doublet_obj <- subset(x = day7_obj, subset = vireo.individual == "doublet")
+unassigned_obj <- subset(x = day7_obj, subset = vireo.individual == "unassigned")
+
+paste("NA19114:")
+print( NA19114_obj)
+cat(paste('\n','NA19130:'))
+print(NA19130_obj)
+cat(paste('\n','NA19152:'))
+print(NA19152_obj)
+cat(paste('\n','doublet:'))
+print(doublet_obj)
+cat(paste('\n','unassigned:'))
+print(unassigned_obj)
+cat(paste('\n','total:'))
+print(day7_obj)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# filtering out unassigned and doublet cells, and cells with less than a certain number of features
+day7_obj <- subset(x = day7_obj, subset = vireo.individual == "doublet", invert = TRUE)
+day7_obj <- subset(x = day7_obj, subset = vireo.individual == "unassigned", invert = TRUE)
+day7_obj <- subset(day7_obj, subset = nFeature_RNA >= 1500)
+
+# print object total cells and features (post-filtering)
+day7_obj
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# normalization, variance stabilization, and dimensionality reduction   
+day7_sct_obj <- SCTransform(day7_obj, variable.features.n = 5000, verbose = FALSE)
+day7_sct_obj <- RunPCA(day7_sct_obj, npcs = 50, verbose = FALSE) 
+day7_sct_obj <- RunUMAP(day7_sct_obj, dims = 1:50, verbose = FALSE)
+# break
+day7_sct_obj <- FindNeighbors(day7_sct_obj, dims = 1:50, verbose = FALSE)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# prepare color palettes
+umap_colors    <- c("#117733", #green
+                    "#AA4499", #purple
+                    "#CC6677", #rose
+                    "#999933", #olive
+                    "#4477AA", #blue
+                    "#332288", #indigo
+                    "#C45F00", #orange
+                    "#882255", #wine
+                    "#44AA99", #teal
+                    "#DDCC77") #sand
+
+bar_colors     <- c("#C45F00", #orange
+                    "#882255", #wine
+                    "#DDCC77", #sand
+                    "#44AA99", #teal 
+                    "#332288", #indigo
+                    "#AA4499", #purple
+                    "#117733", #green
+                    "#4477AA", #blue
+                    "#999933", #olive                   
+                    "#CC6677") #rose
+```
+
+
+
+
+
+
+
+
+```{r, eval=TRUE, echo=TRUE}
+# set cluster resolution
+day7_sct_obj <- FindClusters(day7_sct_obj, resolution = 0.3, verbose = FALSE)
+
+# change order of clusters 
+my_levels <- c( '0', '3', '2', '1', '6', '7', '8', '4', '5', '9')
+day7_sct_obj@active.ident <- factor(x = day7_sct_obj@active.ident, levels = my_levels)
+
+#name clusters
+new_cluster_ids <- c("Cardiomyocytes", "Second heart field", "Fibroblasts", "Epicardial cells", "First heart field", "Endocardial cells",  "Hepatic endoderm", "Foregut endoderm", "Neuroectoderm", "Pluripotent stem cells")    
+names(new_cluster_ids) <- levels(day7_sct_obj)
+day7_sct_obj <- RenameIdents(day7_sct_obj, new_cluster_ids)
+day7_sct_obj$cell_type <- Idents(day7_sct_obj)
+
+# plot umap
+day7_umap <- DimPlot(day7_sct_obj, reduction = "umap", cols = umap_colors) + NoLegend() + 
+  theme(axis.title.y = element_text(size = 8, color = "black"),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(size = 8, colour = "black"),
+        axis.text.x = element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+        xlab("UMAP 1") + ylab("UMAP 2")
+
+day7_totals <- as.data.frame(table(day7_sct_obj@active.ident))
+day7_totals <-  day7_totals %>% mutate(Percent = scales::label_percent(accuracy = .1)(Freq / sum(Freq)))
+
+day7_totals <- day7_totals %>% 
+        rename("Type" = "Var1",
+               "Percent" = "Percent",
+                "Count" = "Freq")
+
+day7_totals$Type <- factor(day7_totals$Type, levels = c(
+                                                        "Hepatic endoderm",
+                                                        "Foregut endoderm",
+                                                        "Pluripotent stem cells", 
+                                                        "Neuroectoderm", 
+                                                        "Endocardial cells",
+                                                        "Second heart field", 
+                                                        "Cardiomyocytes",
+                                                        "First heart field",
+                                                        "Epicardial cells", 
+                                                        "Fibroblasts"))
+
+
+day7_bar <- ggplot(day7_totals, aes(x = Type, y = Count, fill = Type)) +
+  geom_bar(stat = "identity") +
+  coord_flip(clip = "off") +
+  geom_text(aes(label = Percent), size = 2, hjust = -0.01) +
+  scale_fill_manual(values = bar_colors) +
+  NoLegend() + 
+  theme(axis.title.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_text(size = 9, color = "black"),
+        axis.text.x = element_text(size = 8, colour = "black"),
+        panel.background = element_blank()) 
+
+
+# setup layout for printing multiple plots
+umap_layout <- c(area(1, 1), area(1, 2))
+
+#plot umap and cell composition
+p <- day7_umap + day7_bar + plot_layout(design = umap_layout)
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+#ggsave(filename = "fig1B_13Nov23.tiff", height = 3,  dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+```{r, eval=TRUE, include = FALSE}
+# find differentially expressed genes for each cluster, report the top 10 of those that are positive
+all.markers <- FindAllMarkers(day7_sct_obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.1, verbose = TRUE)
+all.markers %>%
+  group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC)-> top
+DoHeatmap(day7_sct_obj, features = top$gene, group.colors = umap_colors, label = FALSE) + theme(legend.title=element_blank())
+```
+
+
+```{r, eval=TRUE, echo=TRUE, warning=FALSE}
+# plot marker gene expression by cluster
+features <- c("POU5F1", "L1TD1", 
+              "SOX2", "CRABP1",
+              "HHEX", "FOXA2", 
+              "AFP",
+              "KDR", "CDH5", "PECAM1", "NFATC1", 
+              "TBX5", "TBX20",
+              "WT1", "TBX18", "BMP4",
+              "COL3A1", "LUM", "POSTN",
+              "EYA1", "ISL1", "FGF10", 
+              "TNNT2", "ACTN2", "RYR2", "CACNA1C", "TNNI3")
+
+p <- DotPlot(day7_sct_obj, col.min = 0, features = features, cols = c("light gray", "dark red"),) + 
+  theme_linedraw() + 
+    theme(
+      legend.direction = "horizontal",
+      legend.position = "bottom",
+      legend.title=element_text(size=9),
+      legend.text=element_text(size=9),
+      axis.title.y = element_blank(), 
+      axis.title.x = element_blank(), 
+      axis.text.x = element_text(angle = 60, vjust = 0, hjust=0),
+      axis.text.y = element_text(colour = umap_colors, face = "bold")) +                               
+      scale_x_discrete(position = "top")
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+#ggsave(filename = "fig1C_13Nov23.tiff",  height = 3.5, dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+NA19114_obj <- subset(x = day7_sct_obj, subset = vireo.individual == "NA19114")
+NA19130_obj <- subset(x = day7_sct_obj, subset = vireo.individual == "NA19130")
+NA19152_obj <- subset(x = day7_sct_obj, subset = vireo.individual == "NA19152")
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# plot cell line NA19114
+NA19114_umap <- DimPlot(NA19114_obj, reduction = "umap", cols = umap_colors) + NoLegend() +
+  theme(axis.title.y = element_text(size = 8, color = "black"),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(size = 8, colour = "black"),
+        axis.text.x = element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+        xlab("UMAP 1") + ylab("UMAP 2")
+
+NA19114_totals <- as.data.frame(table(NA19114_obj@active.ident))
+NA19114_totals <-  NA19114_totals %>% mutate(Percent = scales::label_percent(accuracy = .1)(Freq / sum(Freq)))
+
+NA19114_totals <- NA19114_totals %>% 
+        rename("Type" = "Var1",
+               "Percent" = "Percent",
+                "Count" = "Freq")
+
+NA19114_totals$Type <- factor(NA19114_totals$Type, levels = c(
+                                                        "Hepatic endoderm",
+                                                        "Foregut endoderm",
+                                                        "Pluripotent stem cells", 
+                                                        "Neuroectoderm", 
+                                                        "Endocardial cells",
+                                                        "Second heart field", 
+                                                        "Cardiomyocytes",
+                                                        "First heart field",
+                                                        "Epicardial cells", 
+                                                        "Fibroblasts"))
+
+NA19114_bar <- ggplot(NA19114_totals, aes(x = Type, y = Count, fill = Type)) +
+  geom_bar(stat = "identity") +
+  coord_flip(clip = "off") +
+  geom_text(aes(label = Percent), size = 2, hjust = -0.01) +
+  scale_fill_manual(values = bar_colors) +
+  NoLegend() +
+  theme(axis.title.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_text(size = 9, color = "black"),
+        axis.text.x = element_text(size = 8, colour = "black"),
+        panel.background = element_blank())
+
+p <- NA19114_umap + NA19114_bar + plot_layout(design = umap_layout)
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+#ggsave(filename = "figS1A_13Nov23.tiff", height = 3,  dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# plot cell line NA19130
+NA19130_umap <- DimPlot(NA19130_obj, reduction = "umap", cols = umap_colors) + NoLegend() +
+  theme(axis.title.y = element_text(size = 8, color = "black"),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(size = 8, colour = "black"),
+        axis.text.x = element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+        xlab("UMAP 1") + ylab("UMAP 2")
+
+NA19130_totals <- as.data.frame(table(NA19130_obj@active.ident))
+NA19130_totals <-  NA19130_totals %>% mutate(Percent = scales::label_percent(accuracy = .1)(Freq / sum(Freq)))
+
+NA19130_totals <- NA19130_totals %>% 
+        rename("Type" = "Var1",
+               "Percent" = "Percent",
+                "Count" = "Freq")
+
+NA19130_totals$Type <- factor(NA19130_totals$Type, levels = c(
+                                                        "Hepatic endoderm",
+                                                        "Foregut endoderm",
+                                                        "Pluripotent stem cells", 
+                                                        "Neuroectoderm", 
+                                                        "Endocardial cells",
+                                                        "Second heart field", 
+                                                        "Cardiomyocytes",
+                                                        "First heart field",
+                                                        "Epicardial cells", 
+                                                        "Fibroblasts"))
+
+
+NA19130_bar <- ggplot(NA19130_totals, aes(x = Type, y = Count, fill = Type)) +
+  geom_bar(stat = "identity") +
+  coord_flip(clip = "off") +
+  geom_text(aes(label = Percent), size = 2, hjust = -0.01) +
+  scale_fill_manual(values = bar_colors) +
+  NoLegend() +
+  theme(axis.title.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_text(size = 9, color = "black"),
+        axis.text.x = element_text(size = 8, colour = "black"),
+        panel.background = element_blank()) 
+
+p <- NA19130_umap + NA19130_bar + plot_layout(design = umap_layout)
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+#ggsave(filename = "figS1B_13Nov23.tiff", height = 3,  dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# plot cell line NA19152
+NA19152_umap <- DimPlot(NA19152_obj, reduction = "umap", cols = umap_colors) + NoLegend() +
+  theme(axis.title.y = element_text(size = 8, color = "black"),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(size = 8, colour = "black"),
+        axis.text.x = element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+        xlab("UMAP 1") + ylab("UMAP 2")
+
+NA19152_totals <- as.data.frame(table(NA19152_obj@active.ident))
+NA19152_totals <-  NA19152_totals %>% mutate(Percent = scales::label_percent(accuracy = .1)(Freq / sum(Freq)))
+
+NA19152_totals <- NA19152_totals %>% 
+        rename("Type" = "Var1",
+               "Percent" = "Percent",
+                "Count" = "Freq")
+
+NA19152_totals$Type <- factor(NA19152_totals$Type, levels = c(
+                                                        "Hepatic endoderm",
+                                                        "Foregut endoderm",
+                                                        "Pluripotent stem cells", 
+                                                        "Neuroectoderm", 
+                                                        "Endocardial cells",
+                                                        "Second heart field", 
+                                                        "Cardiomyocytes",
+                                                        "First heart field",
+                                                        "Epicardial cells", 
+                                                        "Fibroblasts"))
+
+
+NA19152_bar <- ggplot(NA19152_totals, aes(x = Type, y = Count, fill = Type)) +
+  geom_bar(stat = "identity") +
+  coord_flip(clip = "off") +
+  geom_text(aes(label = Percent), size = 2, hjust = -0.01) +
+  scale_fill_manual(values = bar_colors) +
+  NoLegend() +
+  theme(axis.title.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_text(size = 9, color = "black"),
+        axis.text.x = element_text(size = 8, colour = "black"),
+        panel.background = element_blank()) 
+
+p <- NA19152_umap + NA19152_bar + plot_layout(design = umap_layout)
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+
+#ggsave(filename = "figS1C_13Nov23.tiff", height = 3,  dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# subset out foregut populations for subclustering for supplemental
+gut <- subset(x = day7_sct_obj, subset = seurat_clusters == 4)
+
+# normalization, variance stabilization, and dimensionality reduction   
+gut <- SCTransform(gut, variable.features.n = 5000, verbose = FALSE)
+gut <- RunPCA(gut, npcs = 50, verbose = FALSE) 
+gut <- RunUMAP(gut, dims = 1:50, verbose = FALSE)
+# break
+gut <- FindNeighbors(gut, dims = 1:50, verbose = FALSE)
+
+gut <- FindClusters(gut, resolution = 0.1, verbose = FALSE)
+
+
+gut_cluster_ids <- c("Anterior foregut", "Posterior foregut")    
+names(gut_cluster_ids) <- levels(gut)
+gut <- RenameIdents(gut, gut_cluster_ids)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# plot gut umap
+p <- DimPlot(gut, reduction = "umap", cols = c("#0077BB", "#EE7733")) +
+  theme(axis.title.y = element_text(size = 8, color = "black"),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(size = 8, colour = "black"),
+        axis.text.x = element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+        xlab("UMAP 1") + ylab("UMAP 2")
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+#ggsave(filename = "figS3A_13Nov23.tiff", height = 3,  dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+SOX2 <- VlnPlot(gut, "SOX2", cols = c("#0077BB", "#EE7733")) + NoLegend() + theme(axis.title.x = element_blank(),
+                                                                                  axis.text.x = element_text(size = 10),
+                                                                                  axis.title.y = element_text(size=12))
+ISL1 <- VlnPlot(gut, "ISL1", cols = c("#0077BB", "#EE7733")) + NoLegend() + theme(axis.title.x = element_blank(), 
+                                                                                  axis.text.x = element_text(size = 10),
+                                                                                  axis.title.y = element_blank())
+IRX3 <- VlnPlot(gut, "IRX3", cols = c("#0077BB", "#EE7733")) + NoLegend() + theme(axis.title.x = element_blank(), 
+                                                                                  axis.text.x = element_text(size = 10),
+                                                                                  axis.title.y = element_blank())
+HNF4A <- VlnPlot(gut, "HNF4A", cols = c("#0077BB", "#EE7733")) + NoLegend() + theme(axis.title.x = element_blank(),
+                                                                                    axis.text.x = element_text(size = 10),
+                                                                                    axis.title.y = element_text(size=12))
+PROX1 <- VlnPlot(gut, "PROX1", cols = c("#0077BB", "#EE7733")) + NoLegend() + theme(axis.title.x = element_blank(), 
+                                                                                    axis.text.x = element_text(size = 10),
+                                                                                    axis.title.y = element_blank())
+FGB <- VlnPlot(gut, "FGB", cols = c("#0077BB", "#EE7733")) + NoLegend() + theme(axis.title.x = element_blank(),
+                                                                                axis.text.x = element_text(size = 10),
+                                                                                axis.title.y = element_blank())
+
+# setup layout for printing multiple plots
+gut_layout <- c(area(1, 1), area(1, 2), area(1, 3))
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# anterior foregut markers = SOX2, ISL1, IRX3
+p <- SOX2 + ISL1 + IRX3 + plot_layout(design = gut_layout)
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+#ggsave(filename = "figS3B_13Nov23.tiff", height = 3,  dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# posterior foregut markers = HNF4A, PROX1, FGB
+p <- HNF4A + PROX1 + FGB + plot_layout(design = gut_layout)
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+#ggsave(filename = "figS3C_13Nov23.tiff", height = 3,  dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+**FIGURE 2 PLOTTING OF GUIDED DIFFERENTIATION AND 16-DAY TIME-COURSE INTEGRATION**
+```{r, eval=FALSE, echo=FALSE}
+# NOTE: the following code chunk was run outside of the Rmarkdown file as a batch job due to high computational requirements and long processing time - the resulting Seurat object is imported in the next chunk
+
+# READ IN 10X DATA
+eb_raw_data <- Read10X("/project2/gilad/emcintire/cell_ranger/220510_A00639_1151_BH3YKKDRX2-YG-EM-17S-lns12/YG-EM-ln1-EM314_human/outs/filtered_feature_bc_matrix/")
+
+
+# CREATE SEURAT OBJECT
+eb_obj <- CreateSeuratObject(counts = eb_raw_data)
+
+
+# DEMULTIPLEX CELL LINES
+# setting directory for deconvolution files
+dir <- "/project2/gilad/emcintire/cell_ranger/220510_A00639_1151_BH3YKKDRX2-YG-EM-17S-lns12/YG-EM-ln1-EM314_human/"
+
+# add vireo information (demultiplex to identify individuals)
+add_vireo <- function(eb_obj, dir) {
+  donor_ids <- read.table(paste0(dir, 'vireo/donor_ids.tsv'), header = TRUE, stringsAsFactors = FALSE)
+  
+  eb_obj <- AddMetaData(eb_obj, donor_ids$donor_id,   col.name ='vireo.individual')
+  eb_obj <- AddMetaData(eb_obj, donor_ids$prob_max,   col.name ='vireo.prob.singlet')
+  
+  ambient.file <- paste0(dir, 'vireo/prop_ambient.tsv')
+  if (file.exists(ambient.file)) {
+    prop <- read.table(paste0(dir, 'vireo/prop_ambient.tsv'), header = TRUE, stringsAsFactors = FALSE)
+    
+    inds <- unique(donor_ids$best_singlet)
+    donor_ids$prop_donor <- 0
+    for (i in 1:length(inds)) {
+      w <- which(donor_ids$best_singlet==inds[i])
+      donor_ids$prop_donor[w] <- prop[w,inds[i]]
+    }
+    eb_obj <- AddMetaData(eb_obj, donor_ids$prop_donor, col.name ='vireo.prop.donor')
+  }
+  eb_obj
+}
+
+eb_obj <- add_vireo(eb_obj, dir)
+
+individual.colname <- ('vireo.individual')
+individual.colname <- individual.colname[which(individual.colname %in% colnames(eb_obj@meta.data))][1]
+
+
+# REMOVE DOUBLET AND UNASSIGNED CELLS
+eb_obj <- subset(x = eb_obj, subset = vireo.individual == "doublet", invert = TRUE)
+eb_obj <- subset(x = eb_obj, subset = vireo.individual == "unassigned", invert = TRUE)
+
+# FILTER CELLS WITH LESS THAN 1500 GENES
+eb_obj <- subset(eb_obj, subset = nFeature_RNA >= 1500)
+
+# confirm successful run
+print("EB COMPLETE")
+
+
+#### MAKE IPSC OBJECT ####
+
+# CREATE LIST OF ALL 57 DIRECTORIES CONTAINING DROPSEQ DATA
+round1_dirs <- list.dirs(path = "/project2/gilad/emcintire/dropseqRunner_round1/output", 
+                         full.names = TRUE, 
+                         recursive=TRUE)                                            # list directories for round 1
+
+round2_dirs <- list.dirs(path = "/project2/gilad/emcintire/dropseqRunner_round2/output", 
+                         full.names = TRUE, 
+                         recursive=TRUE)                                            # list directories for round 2
+
+round3_dirs <- list.dirs(path = "/project2/gilad/emcintire/dropseqRunner_round3/output", 
+                         full.names = TRUE, 
+                         recursive=TRUE)                                            # list directories for round 3
+
+combined_dirs <- c(round1_dirs, 
+                   round2_dirs, 
+                   round3_dirs)                                                     # concatenating the three lists
+
+combined_dirs <- grep("*/Gene/raw", 
+                      combined_dirs, 
+                      value=TRUE)                                                   # pull out only the directories pointing to raw data
+
+combined_dirs <- as.data.frame(combined_dirs)                                       # change object class to data frame
+
+
+# CREATE SEURAT OBJECTS
+rows <- nrow(combined_dirs)                               # set number of loops
+
+mix_list <- list()                                        # initialize empty list to hold mixture names
+
+obj_list <- list()                                        # initialize empty list to hold all Seurat objects
+
+for (i in 1:rows) {                                       # loop to create Seurat objects and match them with demux barcodes
+  
+  path <- combined_dirs[i, ]                              # loop thru directory list and assign each path to variable "path"
+  
+  path <- as.character(path)                              # change the class to character
+  
+  ips_raw_data <- Read10X(path)                           # read in dropseqRunner raw data and create a count matrix
+  
+  mixture <- str_match(path, 
+                       "output/\\s*(.*?)\\s*_0_Solo")     # pulls out only the mixture name from the directory string
+  
+  mixture <- mixture[,2]                                  # assigns mixture name to the variable "mixture"
+  
+  mix_list[[i]] <- mixture                                # creates a list of mixture names for use in merging objects
+  
+  # creates a Seurat object with project field as the respective mixture name
+  ips_obj <- CreateSeuratObject(counts = ips_raw_data,
+                                project = mixture,
+                                assay = "RNA")
+  
+  # creates a list of Seurat objects for use in merging
+  obj_list[[i]] <- ips_obj                                 
+  
+}
+
+
+# MERGE ALL SEURAT OBJECTS INTO A SINGLE OBJECT AND FILTER
+ips_obj <- merge(x = obj_list[[1]],
+                 y = obj_list[c(2:rows)],
+                 add.cell.ids = mix_list[c(1:rows)])        # prefixes cell ID's with the mixture name
+
+# filter the big seurat object for features expressed in at least 10 cells and cells with at least 300 features
+ips_obj <- CreateSeuratObject(counts = ips_obj@assays$RNA@counts, min.cells = 10, min.features = 300) 
+# filter out cells with more than 25% mtDNA
+ips_obj[["percent.mt"]] <- PercentageFeatureSet(ips_obj, pattern = "^MT-")
+ips_obj <- subset(ips_obj, subset = percent.mt <= 25)
+
+
+# PREPARE DEMUXLET FILES
+demux_files <- list.files(path="/project2/gilad/emcintire/demux", 
+                          pattern = "*_demux.best", 
+                          full.names=TRUE)                  # create a list of all 57 demuxlet .best files
+
+demux_list <- list()                                        # initialize empty list to hold all demux dataframes
+
+# prefixes the mixture to the barcode
+for (i in 1:length(demux_files)) {
+  
+  demux_data <- fread(demux_files[[i]])                     # reads in one demux file at a time
+  
+  demux_name <- str_match(demux_files[[i]], 
+                          "demux/\\s*(.*?)\\s*_demux")      # pulls out only demux filename (i.e. mixture) from directory string
+  
+  demux_name <- demux_name[,2]                              # assigns mixture name to variable "demux_name"
+  
+  demux_data$orig.ident <- demux_name                       # adds new column containing mixture name for future merging
+  
+  demux_data$BARCODE <- paste0(demux_name, 
+                               "_", 
+                               demux_data$BARCODE)          # prefixs the respective mixture name to the barcode for future merging
+  
+  demux_list[[i]] <- demux_data                             # creates a list of demux dataframes to combine
+  
+  
+}
+
+# merge all 57 demuxlet dataframes into a single dataframe
+demux_combined <- bind_rows(demux_list)            
+
+
+# FILTER BASED ON DEMUXLET DATA
+# filter out cells with doublet probability greater than 0.3
+demux_combined <- filter(demux_combined, PRB.DBL <= 0.3)
+# remove all ambiguous cells
+demux_combined <- filter(demux_combined, !grepl('AMB', BEST))
+
+
+# PREPARE COLLECTION DATA
+# read in collection day dataframe
+collect_data <- read.table(file = 'AllroundsCollectionInfo.tsv', 
+                           sep = '\t', 
+                           header = TRUE)                    
+
+# add a column of the full mixture ID name
+collect_data <- mutate(collect_data, Mixture = paste0("E", collect_data$Exp, 
+                                                      "CD", collect_data$CD, 
+                                                      "col", collect_data$col))
+
+# subset out the three relevant columns
+collect_data <- subset(collect_data, select = c("Line", "Day", "Mixture"))
+
+
+# ADD COLLECTION DAY TO DEMUXLET DATA
+# merging collection data to Demuxlet data, conditioned on both mixture and cell line
+sample_info <- merge(demux_combined, collect_data, 
+                     by.x=c('orig.ident', 'SNG.1ST'), 
+                     by.y=c('Mixture', 'Line'), 
+                     all = TRUE)
+
+
+# renaming Demuxlet best singlet guess column to individual / cell line
+sample_info <- sample_info %>% rename(Individual = SNG.1ST)
+
+
+#ADD SAMPLE INFO AS METADATA
+# setting sample info barcode column as row names for adding metadata
+sample_coded <-column_to_rownames(sample_info, var = "BARCODE")
+
+# adding sample info as metadata to the big Seurat object and saving as the final object for downstream analyses
+ips_obj <- AddMetaData(object = ips_obj, metadata = sample_coded)
+
+# removing cells not designated as singlets (i.e. individual is n/a)
+ips_obj <- subset(ips_obj, subset = Individual != "NA")
+
+
+# filter cells that have features or reads above or below 4 s.d. from the median
+count.max <- round(median(ips_obj$nCount_RNA) + 4 * sd(ips_obj$nCount_RNA), digits = -2)
+count.min <- round(median(ips_obj$nCount_RNA) - 4 * sd(ips_obj$nCount_RNA), digits = -2)
+feat.max <- round(median(ips_obj$nFeature_RNA) + 4 * sd(ips_obj$nFeature_RNA), digits = -2)
+feat.min <- round(median(ips_obj$nFeature_RNA) - 4 * sd(ips_obj$nFeature_RNA), digits = -2)
+
+if (count.min < 0){
+   count.min <- 0
+} else {
+   count.min <- count.min
+}
+  
+if (feat.min < 0){
+   feat.min <- 0
+} else {
+   feat.min <- feat.min
+}
+
+ips_obj <- subset(ips_obj, subset = nFeature_RNA > feat.min & nFeature_RNA < feat.max & nCount_RNA < count.max & nCount_RNA > count.min)
+
+# confirm successful run
+print("iPSC COMPLETE")
+
+
+#### COMBINE EB AND IPSC OBJECTS ####
+
+# COMBINE AND FORMAT
+# add origin metadata
+ips_obj <- AddMetaData(ips_obj, metadata="Time-course", col.name="Origin")
+eb_obj <- AddMetaData(eb_obj, metadata="Guided differentiation", col.name="Origin")
+
+# make list of two objects
+combined_obj <- merge(ips_obj, y = eb_obj, add.cell.ids = c("IPSC", "EB"), project = "compare")
+
+# the cardiac eb has no "day" that it was harvested, replacing with EB
+combined_obj@meta.data$Day <- combined_obj@meta.data$Day %>% replace_na('EB')
+
+# Run sctransform and integrate objects
+combined_obj <- SplitObject(combined_obj, split.by = "Origin")
+combined_obj <- lapply(X = combined_obj, FUN = SCTransform, variable.features.n = 5000)
+features <- SelectIntegrationFeatures(object.list = combined_obj, nfeatures = 5000)
+combined_obj <- PrepSCTIntegration(object.list = combined_obj, anchor.features = features)
+anchors <- FindIntegrationAnchors(object.list = combined_obj, normalization.method = "SCT", anchor.features = features)
+combined.sct <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
+DefaultAssay(combined.sct) <- "integrated"
+combined.sct <- RunPCA(combined.sct, npcs = 50)
+combined.sct <- RunUMAP(combined.sct, dims = 1:50)
+combined.sct <- FindNeighbors(combined.sct, dims = 1:50)
+
+# confirm successful run
+print("COMBINE COMPLETE")
+
+#change order of day-levels so they are listed chronologically
+combined.sct$Day <- factor(combined.sct$Day, levels = c('Day 0', 'Day 1', 'Day 3', 'Day 5', 'Day 7', 'Day 11', 'Day 15', 'EB'))
+
+# cluster and prepare to run DEG on SCT assay with multiple models
+combined.sct <- FindClusters(combined.sct, resolution = 0.1)
+combined.sct <- PrepSCTFindMarkers(combined.sct)
+
+
+# SAVE OBJECT
+saveRDS(combined.sct, file = "/project2/gilad/emcintire/cell_ranger/integration_analyses/Elorbany_2022/D7_combined_sct_not_clustered_10Nov23.rds")
+
+# confirm successful run
+print("SCRIPT COMPLETE")
+```
+
+
+```{r, eval=FALSE, echo=TRUE}
+# NOTE: the following code chunk was run outside of the Rmarkdown file as a batch job due to high computational requirements and long processing time - the resulting Seurat object is used in the next chunk
+
+# guided differentiation culture referred to as cardiac EB as a variable
+# create Seurat object
+eb_obj <- CreateSeuratObject(counts = eb_raw_data)
+
+# add vireo information (demultiplex to identify individuals)
+add_vireo <- function(eb_obj, dir) {
+  donor_ids <- read.table(paste0(dir, 'vireo/donor_ids.tsv'), header = TRUE, stringsAsFactors = FALSE)
+  
+  eb_obj <- AddMetaData(eb_obj, donor_ids$donor_id,   col.name ='vireo.individual')
+  eb_obj <- AddMetaData(eb_obj, donor_ids$prob_max,   col.name ='vireo.prob.singlet')
+  
+  ambient.file <- paste0(dir, 'vireo/prop_ambient.tsv')
+  if (file.exists(ambient.file)) {
+    prop <- read.table(paste0(dir, 'vireo/prop_ambient.tsv'), header = TRUE, stringsAsFactors = FALSE)
+    
+    inds <- unique(donor_ids$best_singlet)
+    donor_ids$prop_donor <- 0
+    for (i in 1:length(inds)) {
+      w <- which(donor_ids$best_singlet==inds[i])
+      donor_ids$prop_donor[w] <- prop[w,inds[i]]
+    }
+    eb_obj <- AddMetaData(eb_obj, donor_ids$prop_donor, col.name ='vireo.prop.donor')
+  }
+  eb_obj
+}
+
+eb_obj <- add_vireo(eb_obj, dir)
+
+individual.colname <- ('vireo.individual')
+individual.colname <- individual.colname[which(individual.colname %in% colnames(eb_obj@meta.data))][1]
+
+# remove doublet and unassigned cells
+eb_obj <- subset(x = eb_obj, subset = vireo.individual == "doublet", invert = TRUE)
+eb_obj <- subset(x = eb_obj, subset = vireo.individual == "unassigned", invert = TRUE)
+
+# filter cells with less than 1500 genes
+eb_obj <- subset(eb_obj, subset = nFeature_RNA >= 1500)
+
+
+# iPSC timecourse
+# filter cells according to Elorbany publications analysis
+ips_obj <- CreateSeuratObject(counts = ips_obj@assays$RNA@counts, min.cells = 10, min.features = 300) 
+# filter out cells with more than 25% mtDNA
+ips_obj[["percent.mt"]] <- PercentageFeatureSet(ips_obj, pattern = "^MT-")
+ips_obj <- subset(ips_obj, subset = percent.mt <= 25)
+# filter out cells with doublet probability greater than 0.3
+ips_obj <- filter(ips_obj, PRB.DBL <= 0.3)
+# remove all ambiguous cells
+ips_obj <- filter(ips_obj, !grepl('AMB', BEST))
+# filter cells that have features or reads above or below 4 s.d. from the median
+count.max <- round(median(ips_obj$nCount_RNA) + 4 * sd(ips_obj$nCount_RNA), digits = -2)
+count.min <- round(median(ips_obj$nCount_RNA) - 4 * sd(ips_obj$nCount_RNA), digits = -2)
+feat.max <- round(median(ips_obj$nFeature_RNA) + 4 * sd(ips_obj$nFeature_RNA), digits = -2)
+feat.min <- round(median(ips_obj$nFeature_RNA) - 4 * sd(ips_obj$nFeature_RNA), digits = -2)
+ips_obj <- subset(ips_obj, subset = nFeature_RNA > feat.min & nFeature_RNA < feat.max & nCount_RNA < count.max & nCount_RNA > count.min)
+
+# Combine objects and format
+# add origin metadata
+ips_obj <- AddMetaData(ips_obj, metadata="Time-course", col.name="Origin")
+eb_obj <- AddMetaData(eb_obj, metadata="Guided differentiation", col.name="Origin")
+
+# make list of two objects
+int_obj <- merge(ips_obj, y = eb_obj, add.cell.ids = c("IPSC", "EB"), project = "compare")
+
+# the cardiac eb has no "day" that it was harvested, replacing with EB
+int_obj@meta.data$Day <- int_obj@meta.data$Day %>% replace_na('EB')
+
+# Run sctransform and integrate objects
+int_obj <- SplitObject(int_obj, split.by = "Origin")
+int_obj <- lapply(X = int_obj, FUN = SCTransform, variable.features.n = 5000)
+features <- SelectIntegrationFeatures(object.list = int_obj, nfeatures = 5000)
+int_obj <- PrepSCTIntegration(object.list = int_obj, anchor.features = features)
+anchors <- FindIntegrationAnchors(object.list = combined_obj, normalization.method = "SCT", anchor.features = features)
+int_obj <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
+DefaultAssay(int_obj) <- "integrated"
+int_obj <- RunPCA(int_obj, npcs = 50)
+int_obj <- RunUMAP(int_obj, dims = 1:50)
+int_obj <- FindNeighbors(int_obj, dims = 1:50)
+
+#change order of day-levels so they are listed chronologically
+int_obj$Day <- factor(int_obj$Day, levels = c('Day 0', 'Day 1', 'Day 3', 'Day 5', 'Day 7', 'Day 11', 'Day 15', 'EB'))
+
+# cluster and prepare to run DEG on SCT assay with multiple models
+int_obj <- FindClusters(int_obj, resolution = 0.1)
+int_obj <- PrepSCTFindMarkers(int_obj)
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# read in the integrated seurat object 
+int_obj <- readRDS(file = "/project2/gilad/emcintire/cell_ranger/integration_analyses/Elorbany_2022/D7_combined_sct_CLUSTERED_12Nov23_forpub.rds")
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# prepare color palette  
+my_seven_colors <- c("#117733", "#882255", "#CC6677", "#999933", "#44AA99", "#332288", "#AA4499")
+
+# plot UMAP split origin
+DimPlot(int_obj, group.by = 'Origin', cols = c("orange", "light blue"), order = FALSE, raster = FALSE) + 
+  theme(axis.title.y = element_text(size = 8, color = "black"),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(size = 8, colour = "black"),
+        axis.text.x = element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+        xlab("UMAP 1") + ylab("UMAP 2") + NoLegend()
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# plot UMAPs by day
+
+# highlight ipsc-cms day 0 clusters
+cells0_0 <- Cells(subset(x = int_obj, subset = Day == "Day 0" & seurat_clusters == 0))
+cells0_1 <- Cells(subset(x = int_obj, subset = Day == "Day 0" & seurat_clusters == 1))
+cells0_2 <- Cells(subset(x = int_obj, subset = Day == "Day 0" & seurat_clusters == 2))
+cells0_3 <- Cells(subset(x = int_obj, subset = Day == "Day 0" & seurat_clusters == 3))
+cells0_4 <- Cells(subset(x = int_obj, subset = Day == "Day 0" & seurat_clusters == 4))
+cells0_5 <- Cells(subset(x = int_obj, subset = Day == "Day 0" & seurat_clusters == 5))
+#cells0_6 <- Cells(subset(x = int_obj, subset = Day == "Day 0" & seurat_clusters == 6)) # no cells
+
+day0 <- DimPlot(object = int_obj, cells.highlight = list(cells0_0, cells0_1, cells0_2, cells0_3, cells0_4, cells0_5), cols.highlight = c("#332288", "#44AA99", "#999933", "#CC6677", "#882255", "#117733"), cols = "#DDDDDD", order = TRUE, label = FALSE, raster = TRUE, raster.dpi = c(1024, 1024)) + ggtitle("Time-course (day 0)") + theme(plot.title = element_text(hjust = 0.5, size = 11), panel.border = element_rect_round(radius = unit(0.1, "snpc"), color = "black", fill=NA)) + NoLegend() + NoAxes()
+day0
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# highlight ipsc-cms day 1 clusters
+cells1_0 <- Cells(subset(x = int_obj, subset = Day == "Day 1" & seurat_clusters == 0))
+cells1_1 <- Cells(subset(x = int_obj, subset = Day == "Day 1" & seurat_clusters == 1))
+cells1_2 <- Cells(subset(x = int_obj, subset = Day == "Day 1" & seurat_clusters == 2))
+cells1_3 <- Cells(subset(x = int_obj, subset = Day == "Day 1" & seurat_clusters == 3))
+cells1_4 <- Cells(subset(x = int_obj, subset = Day == "Day 1" & seurat_clusters == 4))
+cells1_5 <- Cells(subset(x = int_obj, subset = Day == "Day 1" & seurat_clusters == 5))
+#cells1_6 <- Cells(subset(x = int_obj, subset = Day == "Day 1" & seurat_clusters == 6)) # no cells
+
+day1 <- DimPlot(object = int_obj, cells.highlight = list(cells1_0, cells1_1, cells1_2, cells1_3, cells1_4, cells1_5), cols.highlight = c("#332288", "#44AA99", "#999933", "#CC6677", "#882255", "#117733"), cols = "#DDDDDD", order = TRUE, label = FALSE, raster = TRUE, raster.dpi = c(1024, 1024)) + ggtitle("Time-course (day 1)") + theme(plot.title = element_text(hjust = 0.5, size = 11), panel.border = element_rect_round(radius = unit(0.1, "snpc"), color = "black", fill=NA)) + NoLegend() + NoAxes()
+day1
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# highlight ipsc-cms day 3 clusters
+cells3_0 <- Cells(subset(x = int_obj, subset = Day == "Day 3" & seurat_clusters == 0))
+cells3_1 <- Cells(subset(x = int_obj, subset = Day == "Day 3" & seurat_clusters == 1))
+cells3_2 <- Cells(subset(x = int_obj, subset = Day == "Day 3" & seurat_clusters == 2))
+cells3_3 <- Cells(subset(x = int_obj, subset = Day == "Day 3" & seurat_clusters == 3))
+cells3_4 <- Cells(subset(x = int_obj, subset = Day == "Day 3" & seurat_clusters == 4))
+cells3_5 <- Cells(subset(x = int_obj, subset = Day == "Day 3" & seurat_clusters == 5))
+#cells3_6 <- Cells(subset(x = int_obj, subset = Day == "Day 3" & seurat_clusters == 6)) # no cells
+
+day3 <- DimPlot(object = int_obj, cells.highlight = list(cells3_0, cells3_1, cells3_2, cells3_3, cells3_4, cells3_5), cols.highlight = c("#332288", "#44AA99", "#999933", "#CC6677", "#882255", "#117733"), cols = "#DDDDDD", order = TRUE, label = FALSE, raster = TRUE, raster.dpi = c(1024, 1024)) + ggtitle("Time-course (day 3)") + theme(plot.title = element_text(hjust = 0.5, size = 11), panel.border = element_rect_round(radius = unit(0.1, "snpc"), color = "black", fill=NA)) + NoLegend() + NoAxes()
+day3
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# highlight ipsc-cms day 5 clusters
+cells5_0 <- Cells(subset(x = int_obj, subset = Day == "Day 5" & seurat_clusters == 0))
+cells5_1 <- Cells(subset(x = int_obj, subset = Day == "Day 5" & seurat_clusters == 1))
+cells5_2 <- Cells(subset(x = int_obj, subset = Day == "Day 5" & seurat_clusters == 2))
+cells5_3 <- Cells(subset(x = int_obj, subset = Day == "Day 5" & seurat_clusters == 3))
+cells5_4 <- Cells(subset(x = int_obj, subset = Day == "Day 5" & seurat_clusters == 4))
+cells5_5 <- Cells(subset(x = int_obj, subset = Day == "Day 5" & seurat_clusters == 5))
+cells5_6 <- Cells(subset(x = int_obj, subset = Day == "Day 5" & seurat_clusters == 6))
+
+day5 <- DimPlot(object = int_obj, cells.highlight = list(cells5_0, cells5_1, cells5_2, cells5_3, cells5_4, cells5_5, cells5_6), cols.highlight = c("#AA4499", "#332288", "#44AA99", "#999933", "#CC6677", "#882255", "#117733"), cols = "#DDDDDD", order = TRUE, label = FALSE, raster = TRUE, raster.dpi = c(1024, 1024)) + ggtitle("Time-course (day 5)") + theme(plot.title = element_text(hjust = 0.5, size = 11), panel.border = element_rect_round(radius = unit(0.1, "snpc"), color = "black", fill=NA)) + NoLegend() + NoAxes()
+day5
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# highlight ipsc-cms day 7 clusters
+cells7_0 <- Cells(subset(x = int_obj, subset = Day == "Day 7" & seurat_clusters == 0))
+cells7_1 <- Cells(subset(x = int_obj, subset = Day == "Day 7" & seurat_clusters == 1))
+cells7_2 <- Cells(subset(x = int_obj, subset = Day == "Day 7" & seurat_clusters == 2))
+cells7_3 <- Cells(subset(x = int_obj, subset = Day == "Day 7" & seurat_clusters == 3))
+cells7_4 <- Cells(subset(x = int_obj, subset = Day == "Day 7" & seurat_clusters == 4))
+cells7_5 <- Cells(subset(x = int_obj, subset = Day == "Day 7" & seurat_clusters == 5))
+cells7_6 <- Cells(subset(x = int_obj, subset = Day == "Day 7" & seurat_clusters == 6))
+
+day7 <- DimPlot(object = int_obj, cells.highlight = list(cells7_0, cells7_1, cells7_2, cells7_3, cells7_4, cells7_5, cells7_6), cols.highlight = c("#AA4499", "#332288", "#44AA99", "#999933", "#CC6677", "#882255", "#117733"), cols = "#DDDDDD", order = TRUE, label = FALSE, raster = TRUE, raster.dpi = c(1024, 1024)) + ggtitle("Time-course (day 7)") + theme(plot.title = element_text(hjust = 0.5, size = 11), panel.border = element_rect_round(radius = unit(0.1, "snpc"), color = "black", fill=NA)) + NoLegend() + NoAxes()
+day7
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# highlight ipsc-cms day 11 clusters
+cells11_0 <- Cells(subset(x = int_obj, subset = Day == "Day 11" & seurat_clusters == 0))
+cells11_1 <- Cells(subset(x = int_obj, subset = Day == "Day 11" & seurat_clusters == 1))
+cells11_2 <- Cells(subset(x = int_obj, subset = Day == "Day 11" & seurat_clusters == 2))
+cells11_3 <- Cells(subset(x = int_obj, subset = Day == "Day 11" & seurat_clusters == 3))
+cells11_4 <- Cells(subset(x = int_obj, subset = Day == "Day 11" & seurat_clusters == 4))
+cells11_5 <- Cells(subset(x = int_obj, subset = Day == "Day 11" & seurat_clusters == 5))
+cells11_6 <- Cells(subset(x = int_obj, subset = Day == "Day 11" & seurat_clusters == 6))
+
+day11 <- DimPlot(object = int_obj, cells.highlight = list(cells11_0, cells11_1, cells11_2, cells11_3, cells11_4, cells11_5, cells11_6), cols.highlight = c("#AA4499", "#332288", "#44AA99", "#999933", "#CC6677", "#882255", "#117733"), cols = "#DDDDDD", order = TRUE, label = FALSE, raster = TRUE, raster.dpi = c(1024, 1024)) + ggtitle("Time-course (day 11)") + theme(plot.title = element_text(hjust = 0.5, size = 11), panel.border = element_rect_round(radius = unit(0.1, "snpc"), color = "black", fill=NA)) + NoLegend() + NoAxes()
+day11
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# highlight ipsc-cms day 15 clusters
+cells15_0 <- Cells(subset(x = int_obj, subset = Day == "Day 15" & seurat_clusters == 0))
+cells15_1 <- Cells(subset(x = int_obj, subset = Day == "Day 15" & seurat_clusters == 1))
+cells15_2 <- Cells(subset(x = int_obj, subset = Day == "Day 15" & seurat_clusters == 2))
+cells15_3 <- Cells(subset(x = int_obj, subset = Day == "Day 15" & seurat_clusters == 3))
+cells15_4 <- Cells(subset(x = int_obj, subset = Day == "Day 15" & seurat_clusters == 4))
+cells15_5 <- Cells(subset(x = int_obj, subset = Day == "Day 15" & seurat_clusters == 5))
+cells15_6 <- Cells(subset(x = int_obj, subset = Day == "Day 15" & seurat_clusters == 6))
+
+day15 <- DimPlot(object = int_obj, cells.highlight = list(cells15_1, cells15_2, cells15_3, cells15_4, cells15_5, cells15_6), cols.highlight = c("#AA4499", "#332288", "#44AA99", "#999933", "#CC6677", "#882255", "#117733"), cols = "#DDDDDD", order = TRUE, label = FALSE, raster = TRUE, raster.dpi = c(1024, 1024)) + ggtitle("Time-course (day 15)") + theme(plot.title = element_text(hjust = 0.5, size = 11), panel.border = element_rect_round(radius = unit(0.1, "snpc"), color = "black", fill=NA)) + NoLegend() + NoAxes()
+day15
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# guided differentiation culture referred to as cardiac EB as a variable
+# highlight cardiac EB clusters
+cellsEB_0 <- Cells(subset(x = int_obj, subset = Day == "EB" & seurat_clusters == 0))
+cellsEB_1 <- Cells(subset(x = int_obj, subset = Day == "EB" & seurat_clusters == 1))
+cellsEB_2 <- Cells(subset(x = int_obj, subset = Day == "EB" & seurat_clusters == 2))
+cellsEB_3 <- Cells(subset(x = int_obj, subset = Day == "EB" & seurat_clusters == 3))
+cellsEB_4 <- Cells(subset(x = int_obj, subset = Day == "EB" & seurat_clusters == 4))
+cellsEB_5 <- Cells(subset(x = int_obj, subset = Day == "EB" & seurat_clusters == 5))
+cellsEB_6 <- Cells(subset(x = int_obj, subset = Day == "EB" & seurat_clusters == 6))
+EB <- DimPlot(object = int_obj, cells.highlight = list(cellsEB_0, cellsEB_1, cellsEB_2, cellsEB_3, cellsEB_4, cellsEB_5, cellsEB_6), cols.highlight = c("#AA4499", "#332288", "#44AA99", "#999933", "#CC6677", "#882255", "#117733"), cols = "#DDDDDD", order = TRUE, label = FALSE, raster = TRUE, raster.dpi = c(1024, 1024)) + ggtitle("Guided differentiation (single collection)") + theme(plot.title = element_text(hjust = 0.5, size = 11), panel.border = element_rect_round(radius = unit(0.1, "snpc"), color = "black", fill=NA)) + NoLegend() + NoAxes()
+EB
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# setup layout for printing multiple plots
+p1 <- ggplot(mtcars) + geom_point(aes(mpg, disp))
+p2 <- ggplot(mtcars) + geom_boxplot(aes(gear, disp, group = gear))
+p3 <- ggplot(mtcars) + geom_bar(aes(gear)) + facet_wrap(~cyl)
+umap_layout <- c(area(1, 1), area(1, 2), area(1, 3), area(2, 1), area(2, 2), area(2, 3), area(3, 1), area(3, 2, 4, 3))
+plot(umap_layout)
+
+# plot each ipsc-cm day and the cardiac EB
+p <- day0 + day1 + day3 + day5 + day7 + day11 + day15 + EB + plot_layout(design = umap_layout)
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+#ggsave(filename = "fig2_13Nov23.tiff",  width = 4, dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# plot UMAP entire integrated dataset
+p <- DimPlot(int_obj, reduction = "umap", cols = my_seven_colors, order = FALSE, raster = TRUE, raster.dpi = c(1024, 1024)) + 
+  theme(axis.title.y = element_text(size = 8, color = "black"),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(size = 8, colour = "black"),
+        axis.text.x = element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+        xlab("UMAP 1") + ylab("UMAP 2")
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+#ggsave(filename = "figS4A_13Nov23.tiff",  width = 7, dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# NOTE: while UMAP embedding and clustering are done with the integrated assay, the corrected values are no longer reliable as the quantitative measure of gene expression; for performing differential expression after integration, switch back to the original data
+
+DefaultAssay(int_obj) <- "SCT"
+
+# plot marker gene expression by cluster and split by origin
+features <- c("KDR", 
+              "APOA1",
+              "FOXA2",  
+              "CRABP2",
+              "POU5F1",
+              "CCND1",
+              "LUM",
+              "COL3A1",
+              "TNNT2",                 
+              "TTN")
+
+
+p <- DotPlot(int_obj, features = features, cols = c("#0077BB", "#EE7733"), split.by = "Origin", dot.scale = 8) + coord_flip() + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) + theme(axis.title.y = element_blank(), axis.title.x = element_blank())
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+#ggsave(filename = "figS4B_13Nov23.tiff",  width = 7, dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+**FIGURE 3 PLOTTING OF SCPRED / AUTOMATED CELL ANNOTATION**
+```{r, eval=TRUE, echo=FALSE}
+# read in reference data 
+Miao_2020_umap <- read.table(file = "/project2/gilad/emcintire/cell_ranger/integration_analyses/Miao_2020/umap.txt", sep = '\t', header = TRUE)
+Miao_2020_meta_data <- read.table(file = "/project2/gilad/emcintire/cell_ranger/integration_analyses/Miao_2020/metadata.txt", sep = '\t', header = TRUE)
+Miao_2020_raw_data <- read.table(file = "/project2/gilad/emcintire/cell_ranger/integration_analyses/Miao_2020/expression.txt", sep = '\t', header = TRUE)
+
+# format raw data and metadata for creating a seurat object
+Miao_2020_meta_data <- Miao_2020_meta_data[-1,]    # remove first row of metadata, which just describes the dataclass of each column
+Miao_2020_umap <- Miao_2020_umap[-1,]    # remove first row of metadata, which just describes the dataclass of each column
+
+#set first column as row names
+Miao_2020_meta_fix <- Miao_2020_meta_data[,-1]
+rownames(Miao_2020_meta_fix) <- Miao_2020_meta_data[,1]
+Miao_2020_raw_fix <- Miao_2020_raw_data[,-1]
+rownames(Miao_2020_raw_fix) <- Miao_2020_raw_data[,1]
+Miao_2020_umap_fix <- Miao_2020_umap[,-1]
+rownames(Miao_2020_umap_fix) <- Miao_2020_umap[,1]
+
+
+# create seurat object from reference data
+Miao_2020_reference <- CreateSeuratObject(counts = Miao_2020_raw_fix, meta.data = Miao_2020_meta_fix)
+
+# fix the spelling of epicardium
+Miao_2020_reference@meta.data$Cell_type <- gsub("Epicarduim", "Epicardium", Miao_2020_reference@meta.data$Cell_type)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# add origin info to obj metadata
+Miao_2020_reference <- AddMetaData(Miao_2020_reference, metadata="Miao_2020_fetal_heart", col.name="Origin")
+
+
+# normalization, variance stabilization, and dimensionality reduction for reference
+Miao_2020_reference <- SCTransform(Miao_2020_reference, variable.features.n = 5000, verbose = FALSE)
+Miao_2020_reference <- RunPCA(Miao_2020_reference, npcs = 50, verbose = FALSE) 
+Miao_2020_reference <- RunUMAP(Miao_2020_reference, dims = 1:50, verbose = FALSE, return.model = TRUE)
+# break
+Miao_2020_reference <- FindNeighbors(Miao_2020_reference, dims = 1:50, verbose = FALSE)
+
+# train classifiers with scPred
+Miao_2020_reference <- getFeatureSpace(Miao_2020_reference, "Cell_type")
+Miao_2020_reference <- trainModel(Miao_2020_reference)
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# read in cardiac EB
+cardiac_EB <- Read10X("/project2/gilad/emcintire/cell_ranger/220510_A00639_1151_BH3YKKDRX2-YG-EM-17S-lns12/YG-EM-ln1-EM314_human/outs/filtered_feature_bc_matrix/")
+# setting directory for deconvolution files
+dir <- "/project2/gilad/emcintire/cell_ranger/220510_A00639_1151_BH3YKKDRX2-YG-EM-17S-lns12/YG-EM-ln1-EM314_human/"
+
+# read in day 100 organoid and filter for ≥1,500 features per cell (per Silva publication analysis)
+day_100_organoid <- CreateSeuratObject(Read10X(("/project2/gilad/emcintire/cell_ranger/integration_analyses/Silva_2021/filtered_feature_bc_matrix/")))
+
+# read in PBMCs (negative control)
+pbmc <- CreateSeuratObject(Read10X(("/project2/gilad/emcintire/cell_ranger/integration_analyses/20k_pbmc/filtered_feature_bc_matrix/")))
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# guided differentiation culture referred to as cardiac EB as a variable
+cardiac_EB <- CreateSeuratObject(cardiac_EB)
+
+# add vireo information (demultiplex to identify individuals)
+add_vireo <- function(cardiac_EB, dir) {
+  donor_ids <- read.table(paste0(dir, 'vireo/donor_ids.tsv'), header = TRUE, stringsAsFactors = FALSE)
+  
+  cardiac_EB <- AddMetaData(cardiac_EB, donor_ids$donor_id,   col.name ='vireo.individual')
+  cardiac_EB <- AddMetaData(cardiac_EB, donor_ids$prob_max,   col.name ='vireo.prob.singlet')
+  
+  ambient.file <- paste0(dir, 'vireo/prop_ambient.tsv')
+  if (file.exists(ambient.file)) {
+    prop <- read.table(paste0(dir, 'vireo/prop_ambient.tsv'), header = TRUE, stringsAsFactors = FALSE)
+    
+    inds <- unique(donor_ids$best_singlet)
+    donor_ids$prop_donor <- 0
+    for (i in 1:length(inds)) {
+      w <- which(donor_ids$best_singlet==inds[i])
+      donor_ids$prop_donor[w] <- prop[w,inds[i]]
+    }
+    cardiac_EB <- AddMetaData(cardiac_EB, donor_ids$prop_donor, col.name ='vireo.prop.donor')
+  }
+  cardiac_EB
+}
+
+cardiac_EB <- add_vireo(cardiac_EB, dir)
+
+individual.colname <- ('vireo.individual')
+individual.colname <- individual.colname[which(individual.colname %in% colnames(cardiac_EB@meta.data))][1]
+
+# filter cardiac EB for assigned singlets containing ≥1,500 features per cell
+cardiac_EB <- subset(x = cardiac_EB, subset = vireo.individual == "doublet", invert = TRUE)
+cardiac_EB <- subset(x = cardiac_EB, subset = vireo.individual == "unassigned", invert = TRUE)
+cardiac_EB <- subset(cardiac_EB, subset = nFeature_RNA >= 1500)
+
+# normalization and add meta data
+cardiac_EB <- SCTransform(cardiac_EB, variable.features.n = 5000, verbose = FALSE)
+cardiac_EB <- AddMetaData(cardiac_EB, metadata="day_7_cardiacEB", col.name="Origin")
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# filtering, normalization and add meta data
+day_100_organoid <- subset(day_100_organoid, subset = nFeature_RNA >= 1500)
+day_100_organoid <- SCTransform(day_100_organoid, variable.features.n = 5000, verbose = FALSE)
+day_100_organoid <- AddMetaData(day_100_organoid, metadata="multi-lineage organoid", col.name="Origin")
+
+pbmc <- SCTransform(pbmc, variable.features.n = 5000, verbose = FALSE)
+pbmc <- AddMetaData(pbmc, metadata="PBMCs", col.name="Origin")
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# classify query cells
+cardiac_EB <- scPredict(cardiac_EB, Miao_2020_reference, threshold = 0.9)
+day_100_organoid <- scPredict(day_100_organoid, Miao_2020_reference, threshold = 0.9)
+pbmc <- scPredict(pbmc, Miao_2020_reference, threshold = 0.9)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# run UMAP using only scPred classified cells (unassigned cells not plotted)
+sub_cardiac_EB <- subset(x = cardiac_EB, subset = scpred_prediction == "unassigned", invert = TRUE)
+sub_cardiac_EB <- RunUMAP(sub_cardiac_EB, reduction = "scpred", dims = 1:50)
+
+sub_day_100_organoid <- subset(x = day_100_organoid, subset = scpred_prediction == "unassigned", invert = TRUE)
+sub_day_100_organoid <- RunUMAP(sub_day_100_organoid, reduction = "scpred", dims = 1:50)
+
+sub_pbmc <- subset(x = pbmc, subset = scpred_prediction == "unassigned", invert = TRUE)
+sub_pbmc <- RunUMAP(sub_pbmc, reduction = "scpred", dims = 1:50)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# colors for UMAP plots
+colors <- brewer.pal(n = 11, name = 'Paired')
+
+
+# plot UMAPs
+ref_plot <- DimPlot(object = Miao_2020_reference, reduction = "umap", group.by = "Cell_type", label = FALSE, repel = FALSE, cols = c("#A6CEE3", "#1F78B4", "#B2DF8A", "#33A02C", "#FB9A99", "#E31A1C", "#FDBF6F", "#FF7F00", "#CAB2D6", "#6A3D9A", "#FFFF99")) + 
+  theme(axis.title.y = element_text(size = 8, color = "black"),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(size = 8, colour = "black"),
+        axis.text.x = element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+        xlab("UMAP 1") + ylab("UMAP 2") +
+        ggtitle(NULL) +
+        NoLegend()
+
+guided_plot <- DimPlot(sub_cardiac_EB, group.by = "scpred_prediction", label = FALSE, repel = FALSE, cols = c("#A6CEE3", "#1F78B4", "#B2DF8A", "#33A02C", "#FB9A99", "#E31A1C", "#FDBF6F", "#FF7F00", "#CAB2D6", "#6A3D9A")) + 
+  theme(axis.title.y = element_text(size = 8, color = "black"),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(size = 8, colour = "black"),
+        axis.text.x = element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+        xlab("UMAP 1") + ylab("UMAP 2") +
+        ggtitle(NULL) +
+        NoLegend()
+
+organoid_plot <- DimPlot(sub_day_100_organoid, group.by = "scpred_prediction", label = FALSE, repel = FALSE, cols = c("#A6CEE3", "#1F78B4", "#33A02C", "#E31A1C", "#FDBF6F", "#CAB2D6", "#6A3D9A", "#FFFF99")) + 
+  theme(axis.title.y = element_text(size = 8, color = "black"),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(size = 8, colour = "black"),
+        axis.text.x = element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+        xlab("UMAP 1") + ylab("UMAP 2") +
+        ggtitle(NULL) +
+        NoLegend()
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# setup layout for printing multiple plots
+umaps_layout <- c(area(1, 1), area(2, 1), area(2, 2))
+p <- ref_plot + guided_plot + organoid_plot + plot_layout(design = umaps_layout)
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+#ggsave(filename = "fig3_13Nov23.tiff",  width = 7, dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+# plot PBMCs UMAP for supplement
+p <- DimPlot(sub_pbmc, group.by = "scpred_prediction", label = FALSE, repel = FALSE, cols = c("#FDBF6F")) + 
+  theme(axis.title.y = element_text(size = 8, color = "black"),
+        axis.ticks.y=element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(size = 8, colour = "black"),
+        axis.text.x = element_blank(),
+        axis.ticks.x=element_blank(),
+        panel.background = element_blank()) +
+        xlab("UMAP 1") + ylab("UMAP 2") +
+        ggtitle(NULL)
+
+p
+```
+
+
+```{r, eval=TRUE, echo=FALSE}
+# save image
+ggGetAr <- function(p, default.ar=-1){
+    gb <- ggplot_build(p)
+    ar <- gb$plot$coordinates$ratio
+    g <- ggplot_gtable(gb)
+    nullw <- sapply(g$widths, attr, "unit")
+    nullh <- sapply(g$heights, attr, "unit")
+    if(any(nullw == "null"))
+        ar <- unlist(g$widths[nullw == "null"]) / unlist(g$heights[nullh == "null"])
+    if(is.null(ar))
+        ar <- default.ar
+    ar[1]
+}
+ggsave(filename = "figS5_13Nov23.tiff",  width = 7, dpi = 600, plot = last_plot(), device = tiff, scale = 1, limitsize = TRUE, bg = NULL)
+```
+
+
+```{r, eval=TRUE, echo=TRUE}
+print(sessionInfo())
+```
