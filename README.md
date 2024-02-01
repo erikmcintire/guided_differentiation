@@ -9,4 +9,4 @@ The R directory contains an R Markdown file with code for the following:
 3. Automated annotation of cells from guided differentiation cell cultures, mature multilineage organoids published by Silva, et al. (2021), and a PBMC dataset from 10x Genomics. Automated annotation was performed using the scPred prediction model trained on annotated fetal heart cells published by Miao et al. (2020). This code produces Fig. 3A, 3C, and 3D, as well as Extended Figure 5.
 
 To see the knitted R Markdown file with figures, please visit:
-https://erikmcintire.github.io/Guided_differentiation/
+https://erikmcintire.github.io/guided_differentiation/
